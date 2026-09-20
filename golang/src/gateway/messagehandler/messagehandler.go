@@ -1,6 +1,8 @@
 package messagehandler
 
 import (
+	"log/slog"
+
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
@@ -24,7 +26,8 @@ func (messageHandler *MessageHandler) SerializeEOFMessage() (*middleware.Message
 }
 
 func (messageHandler *MessageHandler) DeserializeResultMessage(message *middleware.Message) ([]fruititem.FruitItem, error) {
-	fruitRecords, _, err := inner.DeserializeMessage(message)
+	fruitRecords, size, err := inner.DeserializeMessage(message)
+	slog.Debug("Deserialized result message", "size", size, "fruitRecords", fruitRecords)
 	if err != nil {
 		return nil, err
 	}

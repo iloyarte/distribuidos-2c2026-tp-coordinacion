@@ -1,9 +1,9 @@
 package middleware
 
 func CreateQueueMiddleware(queueName string, connectionSettings ConnSettings) (Middleware, error) {
-	return nil, nil
+	return NewQueueMiddleware(connectionSettings, queueName)
 }
 
 func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings ConnSettings) (Middleware, error) {
-	return nil, nil
+	return NewExchangeMiddleware(connectionSettings, exchange, keys)
 }

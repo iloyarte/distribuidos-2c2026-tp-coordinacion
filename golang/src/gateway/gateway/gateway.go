@@ -44,6 +44,7 @@ func NewGateway(config GatewayConfig) (*Gateway, error) {
 		inputQueue.Close()
 		return nil, err
 	}
+	slog.Info("Connecting to MOM", "host", config.MomHost, "port", config.MomPort, "inputQueue", config.InputQueueName, "outputQueue", config.OutputQueueName)
 
 	listener, err := net.Listen("tcp", config.ServerHost+":"+config.ServerPort)
 	if err != nil {
@@ -51,6 +52,7 @@ func NewGateway(config GatewayConfig) (*Gateway, error) {
 		outputQueue.Close()
 		return nil, err
 	}
+
 
 	gateway := &Gateway{outputQueue: outputQueue, inputQueue: inputQueue, listener: listener}
 	gateway.running.Store(true)
