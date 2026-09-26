@@ -50,6 +50,16 @@ func (rc *RabbitConnector) declareQueue(queueName string, autoDelete bool, durab
 		exclusive,  // exclusive
 		false,      // no-wait
 		args)
+
+	if err != nil {
+		return amqp.Queue{}, ErrMessageMiddlewareMessage
+	}
+	err = rc.channel.Qos(
+		1,     // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+
 	if err != nil {
 		return amqp.Queue{}, ErrMessageMiddlewareMessage
 	}

@@ -2,35 +2,49 @@ package inner
 
 import (
 	"encoding/json"
-	"errors"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
 
-func serializeJson(message []interface{}) ([]byte, error) {
-	return json.Marshal(message)
+type FruitMessage struct {
+	MessageType MessageType           `json:"messageType"`
+	ClientId    int32                 `json:"clientId"`
+	Fruits      []fruititem.FruitItem `json:"fruits"`
+}
+type MessageType uint8
+
+const (
+	MessageTypeData MessageType = iota + 1
+	MessageTypeEOF
+)
+
+func DataMessage(clientId int32, fruits []fruititem.FruitItem) FruitMessage {
+	return FruitMessage{
+		MessageType: MessageTypeData,
+		ClientId:    clientId,
+		Fruits:      fruits,
+	}
 }
 
-func deserializeJson(message []byte) ([]interface{}, error) {
-	var data []interface{}
+func EOFMessage(clientId int32) FruitMessage {
+	return FruitMessage{
+		MessageType: MessageTypeEOF,
+		ClientId:    clientId,
+		Fruits:      []fruititem.FruitItem{},
+	}
+}
+
+func deserializeJson(message []byte) (FruitMessage, error) {
+	var data FruitMessage
 	if err := json.Unmarshal(message, &data); err != nil {
-		return nil, err
+		return FruitMessage{}, err
 	}
 	return data, nil
 }
 
-func SerializeMessage(fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
-	data := []interface{}{}
-	for _, fruitRecord := range fruitRecords {
-		datum := []interface{}{
-			fruitRecord.Fruit,
-			fruitRecord.Amount,
-		}
-		data = append(data, datum)
-	}
-
-	body, err := serializeJson(data)
+func SerializeMessage(fruitMessage FruitMessage) (*middleware.Message, error) {
+	body, err := json.Marshal(fruitMessage)
 	if err != nil {
 		return nil, err
 	}
@@ -39,32 +53,19 @@ func SerializeMessage(fruitRecords []fruititem.FruitItem) (*middleware.Message, 
 	return &message, nil
 }
 
-func DeserializeMessage(message *middleware.Message) ([]fruititem.FruitItem, bool, error) {
-	data, err := deserializeJson([]byte((*message).Body))
+func DeserializeMessage(message *middleware.Message) (FruitMessage, error) {
+	data, err := deserializeJson([]byte(message.Body))
 	if err != nil {
-		return nil, false, err
+		return FruitMessage{}, err
 	}
 
-	fruitRecords := []fruititem.FruitItem{}
-	for _, datum := range data {
-		fruitPair, ok := datum.([]interface{})
-		if !ok {
-			return nil, false, errors.New("Datum is not an array")
-		}
-
-		fruit, ok := fruitPair[0].(string)
-		if !ok {
-			return nil, false, errors.New("Datum is not a (fruit, amount) pair")
-		}
-
-		fruitAmount, ok := fruitPair[1].(float64)
-		if !ok {
-			return nil, false, errors.New("Datum is not a (fruit, amount) pair")
-		}
-
-		fruitRecord := fruititem.FruitItem{Fruit: fruit, Amount: uint32(fruitAmount)}
-		fruitRecords = append(fruitRecords, fruitRecord)
+	if data.Fruits == nil {
+		data.Fruits = []fruititem.FruitItem{}
 	}
 
-	return fruitRecords, len(fruitRecords) == 0, nil
+	return data, nil
+}
+
+func (fruitMessage FruitMessage) IsEOF() bool {
+	return fruitMessage.MessageType == MessageTypeEOF
 }
