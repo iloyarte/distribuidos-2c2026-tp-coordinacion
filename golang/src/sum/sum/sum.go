@@ -3,6 +3,7 @@ package sum
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -26,6 +27,7 @@ type Sum struct {
 	coordinationExchange middleware.Middleware
 	readyQueue           middleware.Middleware
 	fruitItemMap         map[int32]map[string]fruititem.FruitItem
+	mutex                sync.Mutex
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -47,14 +49,32 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
+	coordinationRoutingKey := []string{fmt.Sprintf("%s_eof", config.SumPrefix)}
+	coordinationExchange, err := middleware.CreateExchangeMiddleware(fmt.Sprintf("%s_coordination", config.SumPrefix), coordinationRoutingKey, connSettings)
+	if err != nil {
+		outputExchange.Close()
+		inputQueue.Close()
+		return nil, err
+	}
+
 	return &Sum{
-		inputQueue:     inputQueue,
-		outputExchange: outputExchange,
-		fruitItemMap:   map[int32]map[string]fruititem.FruitItem{},
+		inputQueue:           inputQueue,
+		outputExchange:       outputExchange,
+		coordinationExchange: coordinationExchange,
+		fruitItemMap:         map[int32]map[string]fruititem.FruitItem{},
 	}, nil
 }
 
 func (sum *Sum) Run() {
+	go func() {
+		err := sum.coordinationExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			sum.handleCoordinationMessage(msg, ack, nack)
+		})
+		if err != nil {
+			slog.Error("While consuming coordination exchange", "err", err)
+		}
+	}()
+
 	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
@@ -82,7 +102,33 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 }
 
 func (sum *Sum) handleEndOfRecordMessage(clientId int32) error {
-	slog.Info("Received End Of Records message")
+	slog.Info("Received End Of Records message", "clientId", clientId)
+	message, err := inner.SerializeMessage(inner.EOFMessage(clientId))
+	if err != nil {
+		return err
+	}
+	return sum.coordinationExchange.Send(*message)
+}
+
+func (sum *Sum) handleCoordinationMessage(msg middleware.Message, ack func(), nack func()) {
+	defer ack()
+
+	message, err := inner.DeserializeMessage(&msg)
+	if err != nil {
+		slog.Error("While deserializing coordination message", "err", err)
+		return
+	}
+
+	if err := sum.flushClient(message.ClientId); err != nil {
+		slog.Error("While flushing client", "clientId", message.ClientId, "err", err)
+	}
+}
+
+func (sum *Sum) flushClient(clientId int32) error {
+	sum.mutex.Lock()
+	defer sum.mutex.Unlock()
+
+	slog.Info("Flushing client", "clientId", clientId)
 	err := sum.sendFruits(clientId)
 	if err != nil {
 		return err
@@ -126,6 +172,9 @@ func (sum *Sum) sendFruits(clientId int32) error {
 }
 
 func (sum *Sum) handleDataMessage(message inner.FruitMessage) error {
+	sum.mutex.Lock()
+	defer sum.mutex.Unlock()
+
 	if _, exists := sum.fruitItemMap[message.ClientId]; !exists {
 		sum.fruitItemMap[message.ClientId] = make(map[string]fruititem.FruitItem)
 	}
