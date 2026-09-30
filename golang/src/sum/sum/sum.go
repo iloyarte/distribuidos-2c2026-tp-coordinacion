@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -79,7 +82,11 @@ func NewSum(config SumConfig) (*Sum, error) {
 }
 
 func (sum *Sum) Run() {
+	defer sum.close()
+
+	coordinationDone := make(chan struct{})
 	go func() {
+		defer close(coordinationDone)
 		err := sum.coordinationExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 			sum.handleCoordinationMessage(msg, ack, nack)
 		})
@@ -87,10 +94,32 @@ func (sum *Sum) Run() {
 			slog.Error("While consuming coordination exchange", "err", err)
 		}
 	}()
+	go sum.handleSignals()
 
-	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
+	if err != nil {
+		slog.Error("While consuming input", "err", err)
+	}
+
+	sum.coordinationExchange.StopConsuming()
+	<-coordinationDone
+}
+
+func (sum *Sum) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	sum.inputQueue.StopConsuming()
+	sum.coordinationExchange.StopConsuming()
+}
+
+func (sum *Sum) close() {
+	sum.inputQueue.Close()
+	sum.coordinationExchange.Close()
+	closeAll(sum.outputExchanges)
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {

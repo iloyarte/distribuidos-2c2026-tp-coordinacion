@@ -3,8 +3,11 @@ package aggregation
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sort"
 	"sync"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -77,7 +80,11 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 }
 
 func (aggregation *Aggregation) Run() {
+	defer aggregation.close()
+
+	coordinationDone := make(chan struct{})
 	go func() {
+		defer close(coordinationDone)
 		err := aggregation.coordinationExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 			aggregation.handleCoordinationMessage(msg, ack, nack)
 		})
@@ -85,10 +92,32 @@ func (aggregation *Aggregation) Run() {
 			slog.Error("While consuming coordination exchange", "err", err)
 		}
 	}()
+	go aggregation.handleSignals()
 
-	aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	err := aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		aggregation.handleMessage(msg, ack, nack)
 	})
+	if err != nil {
+		slog.Error("While consuming input", "err", err)
+	}
+
+	aggregation.coordinationExchange.StopConsuming()
+	<-coordinationDone
+}
+
+func (aggregation *Aggregation) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	aggregation.inputExchange.StopConsuming()
+	aggregation.coordinationExchange.StopConsuming()
+}
+
+func (aggregation *Aggregation) close() {
+	aggregation.inputExchange.Close()
+	aggregation.coordinationExchange.Close()
+	aggregation.outputQueue.Close()
 }
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -203,8 +232,6 @@ func (aggregation *Aggregation) getClientState(clientId int32) *clientState {
 
 func (aggregation *Aggregation) flushIfComplete(clientId int32) error {
 	state := aggregation.clientStates[clientId]
-	// Every record is reported exactly once by the shard that received it,
-	// so reaching the total means every shard has all of its data
 	if state.eofReceived < aggregation.sumAmount || state.coordinatedRecords < state.totalRecords {
 		return nil
 	}
