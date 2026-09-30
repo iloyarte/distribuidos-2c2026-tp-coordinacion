@@ -12,7 +12,8 @@ import (
 var clientIdCounter atomic.Int32
 
 type MessageHandler struct {
-	clientId int32
+	clientId    int32
+	recordsSent int32
 }
 
 func NewMessageHandler() MessageHandler {
@@ -22,12 +23,13 @@ func NewMessageHandler() MessageHandler {
 }
 
 func (messageHandler *MessageHandler) SerializeDataMessage(fruitRecord fruititem.FruitItem) (*middleware.Message, error) {
-	message := inner.DataMessage(messageHandler.clientId, []fruititem.FruitItem{fruitRecord})
+	message := inner.DataMessage(messageHandler.clientId, []fruititem.FruitItem{fruitRecord}, 1)
+	messageHandler.recordsSent++
 	return inner.SerializeMessage(message)
 }
 
 func (messageHandler *MessageHandler) SerializeEOFMessage() (*middleware.Message, error) {
-	message := inner.EOFMessage(messageHandler.clientId)
+	message := inner.EOFMessage(messageHandler.clientId, messageHandler.recordsSent)
 	return inner.SerializeMessage(message)
 }
 

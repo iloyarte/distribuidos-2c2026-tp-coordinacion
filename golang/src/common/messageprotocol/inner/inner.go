@@ -11,6 +11,8 @@ type FruitMessage struct {
 	MessageType MessageType           `json:"messageType"`
 	ClientId    int32                 `json:"clientId"`
 	Fruits      []fruititem.FruitItem `json:"fruits"`
+	Count       int32                 `json:"count"`
+	Total       int32                 `json:"total"`
 }
 type MessageType uint8
 
@@ -19,19 +21,21 @@ const (
 	MessageTypeEOF
 )
 
-func DataMessage(clientId int32, fruits []fruititem.FruitItem) FruitMessage {
+func DataMessage(clientId int32, fruits []fruititem.FruitItem, count int32) FruitMessage {
 	return FruitMessage{
 		MessageType: MessageTypeData,
 		ClientId:    clientId,
 		Fruits:      fruits,
+		Count:       count,
 	}
 }
 
-func EOFMessage(clientId int32) FruitMessage {
+func EOFMessage(clientId int32, total int32) FruitMessage {
 	return FruitMessage{
 		MessageType: MessageTypeEOF,
 		ClientId:    clientId,
 		Fruits:      []fruititem.FruitItem{},
+		Total:       total,
 	}
 }
 
