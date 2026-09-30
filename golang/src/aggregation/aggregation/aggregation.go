@@ -24,19 +24,22 @@ type AggregationConfig struct {
 }
 
 type clientState struct {
-	eofReceived     int
-	recordsReceived int32
-	totalRecords    int32
+	eofReceived        int
+	recordsReceived    int32
+	totalRecords       int32
+	reportedRecords    int32
+	coordinatedRecords int32
 }
 
 type Aggregation struct {
-	outputQueue   middleware.Middleware
-	inputExchange middleware.Middleware
-	fruitItemMap  map[int32]map[string]fruititem.FruitItem
-	clientStates  map[int32]*clientState
-	sumAmount     int
-	topSize       int
-	mutex         sync.Mutex
+	outputQueue          middleware.Middleware
+	inputExchange        middleware.Middleware
+	coordinationExchange middleware.Middleware
+	fruitItemMap         map[int32]map[string]fruititem.FruitItem
+	clientStates         map[int32]*clientState
+	sumAmount            int
+	topSize              int
+	mutex                sync.Mutex
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -54,17 +57,35 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		return nil, err
 	}
 
+	coordinationRoutingKey := []string{fmt.Sprintf("%s_count", config.AggregationPrefix)}
+	coordinationExchange, err := middleware.CreateExchangeMiddleware(fmt.Sprintf("%s_coordination", config.AggregationPrefix), coordinationRoutingKey, connSettings)
+	if err != nil {
+		inputExchange.Close()
+		outputQueue.Close()
+		return nil, err
+	}
+
 	return &Aggregation{
-		outputQueue:   outputQueue,
-		inputExchange: inputExchange,
-		fruitItemMap:  map[int32]map[string]fruititem.FruitItem{},
-		clientStates:  map[int32]*clientState{},
-		sumAmount:     config.SumAmount,
-		topSize:       config.TopSize,
+		outputQueue:          outputQueue,
+		inputExchange:        inputExchange,
+		coordinationExchange: coordinationExchange,
+		fruitItemMap:         map[int32]map[string]fruititem.FruitItem{},
+		clientStates:         map[int32]*clientState{},
+		sumAmount:            config.SumAmount,
+		topSize:              config.TopSize,
 	}, nil
 }
 
 func (aggregation *Aggregation) Run() {
+	go func() {
+		err := aggregation.coordinationExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			aggregation.handleCoordinationMessage(msg, ack, nack)
+		})
+		if err != nil {
+			slog.Error("While consuming coordination exchange", "err", err)
+		}
+	}()
+
 	aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		aggregation.handleMessage(msg, ack, nack)
 	})
@@ -99,6 +120,13 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(clientId int32, totalR
 	state.eofReceived++
 	state.totalRecords = totalRecords
 	slog.Info("Received End Of Records message", "clientId", clientId, "eofReceived", state.eofReceived, "expected", aggregation.sumAmount)
+	if state.eofReceived < aggregation.sumAmount {
+		return nil
+	}
+	if err := aggregation.reportRecords(clientId); err != nil {
+		return err
+	}
+	// Other shards may have already reported everything, or the client sent no records at all
 	return aggregation.flushIfComplete(clientId)
 }
 
@@ -116,8 +144,52 @@ func (aggregation *Aggregation) handleDataMessage(clientId int32, fruitRecords [
 			aggregation.fruitItemMap[clientId][fruitRecord.Fruit] = fruitRecord
 		}
 	}
-	aggregation.getClientState(clientId).recordsReceived += recordCount
-	return aggregation.flushIfComplete(clientId)
+	state := aggregation.getClientState(clientId)
+	state.recordsReceived += recordCount
+	if state.eofReceived < aggregation.sumAmount {
+		return nil
+	}
+	// Late partial sent by a sum after its flush
+	slog.Info("Received records after all EOFs", "clientId", clientId, "records", state.recordsReceived)
+	return aggregation.reportRecords(clientId)
+}
+
+// reportRecords tells every aggregation how many records of the client this shard received
+// since its last report. Shards with nothing new stay silent.
+func (aggregation *Aggregation) reportRecords(clientId int32) error {
+	state := aggregation.clientStates[clientId]
+	newRecords := state.recordsReceived - state.reportedRecords
+	if newRecords == 0 {
+		return nil
+	}
+	message, err := inner.SerializeMessage(inner.DataMessage(clientId, []fruititem.FruitItem{}, newRecords))
+	if err != nil {
+		return err
+	}
+	if err := aggregation.coordinationExchange.Send(*message); err != nil {
+		return err
+	}
+	state.reportedRecords = state.recordsReceived
+	return nil
+}
+
+func (aggregation *Aggregation) handleCoordinationMessage(msg middleware.Message, ack func(), nack func()) {
+	defer ack()
+
+	message, err := inner.DeserializeMessage(&msg)
+	if err != nil {
+		slog.Error("While deserializing coordination message", "err", err)
+		return
+	}
+
+	aggregation.mutex.Lock()
+	defer aggregation.mutex.Unlock()
+
+	state := aggregation.getClientState(message.ClientId)
+	state.coordinatedRecords += message.Count
+	if err := aggregation.flushIfComplete(message.ClientId); err != nil {
+		slog.Error("While flushing client", "clientId", message.ClientId, "err", err)
+	}
 }
 
 func (aggregation *Aggregation) getClientState(clientId int32) *clientState {
@@ -131,10 +203,12 @@ func (aggregation *Aggregation) getClientState(clientId int32) *clientState {
 
 func (aggregation *Aggregation) flushIfComplete(clientId int32) error {
 	state := aggregation.clientStates[clientId]
-	if state.eofReceived < aggregation.sumAmount || state.recordsReceived < state.totalRecords {
+	// Every record is reported exactly once by the shard that received it,
+	// so reaching the total means every shard has all of its data
+	if state.eofReceived < aggregation.sumAmount || state.coordinatedRecords < state.totalRecords {
 		return nil
 	}
-	slog.Info("Client complete, sending top", "clientId", clientId, "records", state.recordsReceived)
+	slog.Info("Client complete, sending partial top", "clientId", clientId, "records", state.recordsReceived)
 
 	fruitTopRecords := aggregation.buildFruitTop(clientId)
 	message, err := inner.SerializeMessage(inner.DataMessage(clientId, fruitTopRecords, state.recordsReceived))

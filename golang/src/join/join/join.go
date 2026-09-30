@@ -2,7 +2,9 @@ package join
 
 import (
 	"log/slog"
+	"sort"
 
+	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
@@ -19,9 +21,17 @@ type JoinConfig struct {
 	TopSize           int
 }
 
+type clientState struct {
+	partialTops  []fruititem.FruitItem
+	eofsReceived int
+}
+
 type Join struct {
-	inputQueue  middleware.Middleware
-	outputQueue middleware.Middleware
+	inputQueue        middleware.Middleware
+	outputQueue       middleware.Middleware
+	clientStates      map[int32]*clientState
+	aggregationAmount int
+	topSize           int
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -38,13 +48,23 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	return &Join{inputQueue: inputQueue, outputQueue: outputQueue}, nil
+	return &Join{
+		inputQueue:        inputQueue,
+		outputQueue:       outputQueue,
+		clientStates:      map[int32]*clientState{},
+		aggregationAmount: config.AggregationAmount,
+		topSize:           config.TopSize,
+	}, nil
 }
 
 func (join *Join) Run() {
-	join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	err := join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		join.handleMessage(msg, ack, nack)
 	})
+	if err != nil {
+		join.inputQueue.Close()
+		join.outputQueue.Close()
+	}
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -54,9 +74,37 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
-	if !message.IsEOF() {
-		if err := join.outputQueue.Send(msg); err != nil {
-			slog.Error("While sending top", "err", err)
-		}
+
+	state, exists := join.clientStates[message.ClientId]
+	if !exists {
+		state = &clientState{}
+		join.clientStates[message.ClientId] = state
 	}
+
+	if !message.IsEOF() {
+		state.partialTops = append(state.partialTops, message.Fruits...)
+		return
+	}
+
+	state.eofsReceived++
+	slog.Info("Received partial top", "clientId", message.ClientId, "eofsReceived", state.eofsReceived, "expected", join.aggregationAmount)
+	if state.eofsReceived < join.aggregationAmount {
+		return
+	}
+	if err := join.sendTop(message.ClientId, state.partialTops); err != nil {
+		slog.Error("While sending top", "clientId", message.ClientId, "err", err)
+	}
+	delete(join.clientStates, message.ClientId)
+}
+
+func (join *Join) sendTop(clientId int32, fruitItems []fruititem.FruitItem) error {
+	sort.SliceStable(fruitItems, func(i, j int) bool {
+		return fruitItems[j].Less(fruitItems[i])
+	})
+	finalTopSize := min(join.topSize, len(fruitItems))
+	message, err := inner.SerializeMessage(inner.DataMessage(clientId, fruitItems[:finalTopSize], 0))
+	if err != nil {
+		return err
+	}
+	return join.outputQueue.Send(*message)
 }

@@ -2,6 +2,7 @@ package sum
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 
@@ -23,12 +24,19 @@ type SumConfig struct {
 
 type Sum struct {
 	inputQueue           middleware.Middleware
-	outputExchange       middleware.Middleware
+	outputExchanges      []middleware.Middleware
 	coordinationExchange middleware.Middleware
 	fruitItemMap         map[int32]map[string]fruititem.FruitItem
-	processedRecords     map[int32]int32
+	processedRecords     map[int32][]int32
 	sentRecords          map[int32]int32
+	aggregationAmount    int
 	mutex                sync.Mutex
+}
+
+func closeAll(middlewares []middleware.Middleware) {
+	for _, m := range middlewares {
+		m.Close()
+	}
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -39,32 +47,34 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	outputExchangeRouteKeys := make([]string, config.AggregationAmount)
+	outputExchanges := make([]middleware.Middleware, 0, config.AggregationAmount)
 	for i := range config.AggregationAmount {
-		outputExchangeRouteKeys[i] = fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
-	}
-
-	outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
-	if err != nil {
-		inputQueue.Close()
-		return nil, err
+		routingKey := []string{fmt.Sprintf("%s_%d", config.AggregationPrefix, i)}
+		outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, routingKey, connSettings)
+		if err != nil {
+			closeAll(outputExchanges)
+			inputQueue.Close()
+			return nil, err
+		}
+		outputExchanges = append(outputExchanges, outputExchange)
 	}
 
 	coordinationRoutingKey := []string{fmt.Sprintf("%s_eof", config.SumPrefix)}
 	coordinationExchange, err := middleware.CreateExchangeMiddleware(fmt.Sprintf("%s_coordination", config.SumPrefix), coordinationRoutingKey, connSettings)
 	if err != nil {
-		outputExchange.Close()
+		closeAll(outputExchanges)
 		inputQueue.Close()
 		return nil, err
 	}
 
 	return &Sum{
 		inputQueue:           inputQueue,
-		outputExchange:       outputExchange,
+		outputExchanges:      outputExchanges,
 		coordinationExchange: coordinationExchange,
 		fruitItemMap:         map[int32]map[string]fruititem.FruitItem{},
-		processedRecords:     map[int32]int32{},
+		processedRecords:     map[int32][]int32{},
 		sentRecords:          map[int32]int32{},
+		aggregationAmount:    config.AggregationAmount,
 	}, nil
 }
 
@@ -140,23 +150,29 @@ func (sum *Sum) flushClient(clientId int32, total int32) error {
 }
 
 func (sum *Sum) sendPartialResults(clientId int32) error {
-	processed := sum.processedRecords[clientId]
-	if processed == 0 {
+	processed, exists := sum.processedRecords[clientId]
+	if !exists {
 		return nil
 	}
 
-	fruitRecords := make([]fruititem.FruitItem, 0, len(sum.fruitItemMap[clientId]))
+	buckets := make([][]fruititem.FruitItem, sum.aggregationAmount)
 	for _, fruitRecord := range sum.fruitItemMap[clientId] {
-		fruitRecords = append(fruitRecords, fruitRecord)
+		i := hashFruit(fruitRecord.Fruit, sum.aggregationAmount)
+		buckets[i] = append(buckets[i], fruitRecord)
 	}
-	message, err := inner.SerializeMessage(inner.DataMessage(clientId, fruitRecords, processed))
-	if err != nil {
-		slog.Debug("While serializing message", "err", err)
-		return err
-	}
-	if err := sum.outputExchange.Send(*message); err != nil {
-		slog.Debug("While sending message", "err", err)
-		return err
+	for i, outputExchange := range sum.outputExchanges {
+		if processed[i] == 0 {
+			continue
+		}
+		message, err := inner.SerializeMessage(inner.DataMessage(clientId, buckets[i], processed[i]))
+		if err != nil {
+			slog.Debug("While serializing message", "err", err)
+			return err
+		}
+		if err := outputExchange.Send(*message); err != nil {
+			slog.Debug("While sending message", "err", err)
+			return err
+		}
 	}
 	delete(sum.fruitItemMap, clientId)
 	delete(sum.processedRecords, clientId)
@@ -169,9 +185,11 @@ func (sum *Sum) sendEOF(clientId int32, total int32) error {
 		slog.Debug("While serializing EOF message", "err", err)
 		return err
 	}
-	if err := sum.outputExchange.Send(*message); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
+	for _, outputExchange := range sum.outputExchanges {
+		if err := outputExchange.Send(*message); err != nil {
+			slog.Debug("While sending EOF message", "err", err)
+			return err
+		}
 	}
 	return nil
 }
@@ -183,6 +201,9 @@ func (sum *Sum) handleDataMessage(message inner.FruitMessage) error {
 	if _, exists := sum.fruitItemMap[message.ClientId]; !exists {
 		sum.fruitItemMap[message.ClientId] = make(map[string]fruititem.FruitItem)
 	}
+	if _, exists := sum.processedRecords[message.ClientId]; !exists {
+		sum.processedRecords[message.ClientId] = make([]int32, sum.aggregationAmount)
+	}
 	for _, fruitRecord := range message.Fruits {
 		_, ok := sum.fruitItemMap[message.ClientId][fruitRecord.Fruit]
 		if ok {
@@ -190,12 +211,19 @@ func (sum *Sum) handleDataMessage(message inner.FruitMessage) error {
 		} else {
 			sum.fruitItemMap[message.ClientId][fruitRecord.Fruit] = fruitRecord
 		}
+		fruitBucket := hashFruit(fruitRecord.Fruit, sum.aggregationAmount)
+		sum.processedRecords[message.ClientId][fruitBucket]++
 	}
-	sum.processedRecords[message.ClientId] += int32(len(message.Fruits))
 
 	if _, flushed := sum.sentRecords[message.ClientId]; flushed {
 		slog.Info("Forwarding record received after flush", "clientId", message.ClientId)
 		return sum.sendPartialResults(message.ClientId)
 	}
 	return nil
+}
+
+func hashFruit(fruit string, aggregationAmount int) int {
+	hasher := fnv.New32a()
+	hasher.Write([]byte(fruit))
+	return int(hasher.Sum32() % uint32(aggregationAmount))
 }
